@@ -1,23 +1,40 @@
-CFLAGS:=-Wall -Werror -g
+OPENSSL11?=0
+OPENSSL11_DIR:=../../openssl/install
+
+PORT?=55555
+CIPHER?=AES256-GCM-SHA384
+DURATION?=10
+
+CFLAGS:=-Wall -Werror -g -pthread
 CFLAGS+= -O2
-LDFLAGS:=-g
+LDFLAGS:=-g -pthread
 LDLIBS:=-lssl -lcrypto
 
-all: ssl
+ifneq ($(OPENSSL11), 0)
+OPENSSL11_BINDIR:=$(OPENSSL11_DIR)/bin
+OPENSSL11_LIBDIR:=$(OPENSSL11_DIR)/lib
+CFLAGS+=-I ../../openssl/install/include -Wno-deprecated-declarations
+LDLIBS+=-L$(OPENSSL11_LIBDIR)
+export PATH:=$(OPENSSL11_BINDIR):$(PATH)
+export LD_LIBRARY_PATH:=$(OPENSSL11_LIBDIR):$(LD_LIBRARY_PATH)
+endif
 
-ssl: ssl.c
+all: server client
+
+server: server.c
+
+client: client.c
 
 clean:
-	$(RM) ssl
+	$(RM) server client
 
-test: ssl
-	./ssl 55555 </dev/zero >/dev/null &
-	sleep 1
-	dd if=/dev/zero count=1000000 bs=300 | ncat --ssl 127.0.0.1 55555 | dd of=/dev/null bs=300
+test: server client
+	./server $(PORT) $(CIPHER) &
+	sleep 0.5
+	./client 127.0.0.1 $(PORT) $(CIPHER) < /dev/zero > /dev/null &
+	./client 127.0.0.1 $(PORT) $(CIPHER) < /dev/zero > /dev/null &
+	sleep $(DURATION)
+	-pkill client
+	-pkill server
 
-test-nossl:
-	ncat -l 55555 </dev/zero >/dev/null &
-	sleep 1
-	dd if=/dev/zero count=10000000 bs=300 | ncat localhost 55555 | dd of=/dev/null bs=300
-
-.PHONY: all clean test test-nossl
+.PHONY: all clean test
