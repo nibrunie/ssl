@@ -5,7 +5,7 @@ PORT?=55555
 CIPHER?=AES256-GCM-SHA384
 DURATION?=10
 
-CFLAGS:=-Wall -Werror -g -pthread
+CFLAGS:=-Wall -Werror -g -pthread -std=gnu99
 CFLAGS+= -O2
 LDFLAGS:=-g -pthread
 LDLIBS:=-lssl -lcrypto
