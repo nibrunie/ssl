@@ -51,16 +51,20 @@ int main(int argc, const char **argv)
 	err = SSL_connect(ssl);
 	ASSERT_SSL(1 == err);
 
-	fd_set rfds;
+	fd_set rfds, wfds;
 	FD_ZERO(&rfds);
+	FD_ZERO(&wfds);
 
 	for (;;) {
 		static __thread char buf[PACKET_SIZE];
 		FD_SET(STDIN_FILENO, &rfds);
 		FD_SET(sock, &rfds);
-		err = select(sock+1, &rfds, NULL, NULL, NULL);
+		FD_SET(STDOUT_FILENO, &wfds);
+		FD_SET(sock, &wfds);
+		err = select(sock+1, &rfds, &wfds, NULL, NULL);
 		ASSERT(-1 != err, "select()");
-		if (FD_ISSET(STDIN_FILENO, &rfds)) {
+		if (FD_ISSET(STDIN_FILENO, &rfds)
+				&& FD_ISSET(sock, &wfds)) {
 			err = read(STDIN_FILENO, buf, sizeof(buf));
 			if (0 == err) break;
 			ASSERT(sizeof(buf) == err, "read()");
@@ -68,10 +72,11 @@ int main(int argc, const char **argv)
 			if (0 == err) break;
 			ASSERT_SSL(sizeof(buf) == err);
 		}
-		if (FD_ISSET(sock, &rfds)) {
+		if (FD_ISSET(sock, &rfds)
+				&& FD_ISSET(STDOUT_FILENO, &wfds)) {
 			err = SSL_read(ssl, buf, err);
+			ASSERT_SSL(err >= 0);
 			if (0 == err) break;
-			ASSERT_SSL(sizeof(buf) == err);
 			err = write(STDOUT_FILENO, buf, sizeof(buf));
 			if (0 == err) break;
 			ASSERT_SSL(sizeof(buf) == err);

@@ -21,7 +21,8 @@
 #define STATS_UPDATE_FREQ	1
 
 typedef struct {
-	SSL *ssl;
+	BIO *ssl_in;
+	BIO *ssl_out;
 	int in;
 	int out;
 	pthread_t thread;
@@ -35,50 +36,58 @@ static void * ssl_worker(void *worker_)
 {
 	static __thread char buf[PACKET_SIZE];
 	ssl_worker_t *worker = worker_;
-	SSL *ssl = worker->ssl;
+	BIO *ssl_in = worker->ssl_in;
+	BIO *ssl_out = worker->ssl_out;
 	int in = worker->in;
 	int out = worker->out;
 
-	int sock = SSL_get_fd(ssl);
-	ASSERT_SSL(sock >= 0);
-	int nfds = (sock < in ? in : sock) + 1;
 	fd_set rfds;
 	FD_ZERO(&rfds);
 
+	timestats_t ts;
+	timestats_start(&ts);
+	int pkt = 0;
 	for (;;) {
-		timestats_t ts;
-		timestats_start(&ts);
-		for (int i=0; i<STATS_UPDATE_FREQ; i++) {
-			FD_SET(sock, &rfds);
-			FD_SET(in, &rfds);
-			int err = select(nfds, &rfds, NULL, NULL, NULL);
-			ASSERT(-1 != err, "select()");
-			if (FD_ISSET(sock, &rfds)) {
-				err = SSL_read(ssl, buf, sizeof(buf));
-				if (0 == err) return 0;
-				ASSERT_SSL(sizeof(buf) == err);
-				err = write(out, buf, err);
-				if (0 == err) return 0;
-				ASSERT(sizeof(buf) == err, "write()");
+		FD_SET(in, &rfds);
+		int err = select(in+1, &rfds, NULL, NULL, (struct timeval[]){{0,100}});
+		ASSERT(-1 != err, "select()");
+		if (FD_ISSET(in, &rfds)) {
+			err = read(in, buf, sizeof(buf));
+			if (0 == err) break;
+			ASSERT(sizeof(buf) == err, "read()");
+			err = BIO_write(ssl_out, buf, err);
+			ASSERT_SSL(err >= 0)
+			if (0 == err) break;
+			if (err < sizeof(buf)) {
+				/* partial write happens when buffer_w_bio is full */
+				int rem = sizeof(buf) - err;
+				err = BIO_write(ssl_out, &buf[err], rem);
+				ASSERT_SSL(err == rem);
 			}
-			if (FD_ISSET(in, &rfds)) {
-				err = read(in, buf, sizeof(buf));
-				if (0 == err) return 0;
-				ASSERT(sizeof(buf) == err, "read()");
-				err = SSL_write(ssl, buf, err);
-				if (0 == err) return 0;
-				ASSERT_SSL(sizeof(buf) == err);
-			}
+			pkt++;
 		}
-		timestats_stop(&ts);
-		stats_update(&worker->stats, STATS_UPDATE_FREQ, PACKET_SIZE, &ts);
+		err = BIO_read(ssl_in, buf, sizeof(buf));
+		if (0 != err) {
+			ASSERT_SSL(sizeof(buf) == err);
+			err = write(out, buf, err);
+			if (0 == err) break;
+			ASSERT(sizeof(buf) == err, "write()");
+			pkt++;
+		}
+		if (STATS_UPDATE_FREQ <= pkt) {
+			timestats_stop(&ts);
+			stats_update(&worker->stats, pkt, PACKET_SIZE, &ts);
+			pkt = 0;
+			timestats_start(&ts);
+		}
 	}
 	return NULL;
 }
 
-static void ssl_worker_spawn(int tid, SSL *ssl, int in, int out)
+static void ssl_worker_spawn(int tid, BIO *bio[2], int in, int out)
 {
-	workers[tid].ssl = ssl;
+	workers[tid].ssl_in = bio[0];
+	workers[tid].ssl_out = bio[1];
 	workers[tid].in = in;
 	workers[tid].out = out;
 	workers[tid].tid = tid;
@@ -86,44 +95,53 @@ static void ssl_worker_spawn(int tid, SSL *ssl, int in, int out)
 	ASSERT(0 == err, "pthread_create(ssl_worker) failed");
 }
 
-static int ssl_listen(int port)
+static BIO * ssl_listen(const char *port, BIO *ssl_bio)
 {
-	int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	ASSERT(sock >= 0, "socket");
-
-	struct sockaddr_in sa_serv;
-	memset(&sa_serv, 0, sizeof(sa_serv));
-	sa_serv.sin_family = AF_INET;
-	sa_serv.sin_addr.s_addr = INADDR_ANY;
-	sa_serv.sin_port = htons(port);
-	int err = bind(sock, (struct sockaddr *)&sa_serv, sizeof(sa_serv));
-	ASSERT(0 == err, "bind()");
-
-	err = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (int[]){1}, sizeof(int));
-	ASSERT(0 == err, "setsockopt");
-
-	err = listen(sock, 5);
-	ASSERT(0 == err, "listen");
-
-	return sock;
+	BIO *accept_bio = BIO_new_accept(port);
+	ASSERT_SSL(accept_bio);
+	BIO_set_accept_bios(accept_bio, ssl_bio);
+	int err = BIO_do_accept(accept_bio);
+	ASSERT_SSL(err > 0);
+	return accept_bio;
 }
 
-static SSL * ssl_accept(SSL_CTX *ctx, int listen_sock)
+static void ssl_accept(BIO *bio[2], BIO *accept_bio)
 {
-	struct sockaddr_in sa_cli;
-	int sock = accept(listen_sock, (struct sockaddr*)&sa_cli, (socklen_t[]){sizeof(sa_cli)});
-	ASSERT(sock >= 0, "accept");
-
-	fprintf(stderr, "Connection from %x, port %x\n", sa_cli.sin_addr.s_addr,
-			sa_cli.sin_port);
-
-	SSL *ssl = SSL_new(ctx);
+	int err = BIO_do_accept(accept_bio);
+	ASSERT_SSL(err > 0);
+	BIO *ssl_bio = BIO_pop(accept_bio);
+	err = BIO_do_handshake(ssl_bio);
+	ASSERT_SSL(err > 0);
+	/*
+	 * Abusing SSL bio here...
+	 * bio chain is accept<-->ssl<-->socket
+	 * break it apart and rebuild to
+	 *   read:  socket --> buffer --> ssl
+	 *   write: buffer --> ssl --> socket
+	 * As crypto ops happened in SSL bio,
+	 * we buffer data before reading or writing
+	 * to SSL to maximize performance
+	 */
+	BIO *sock_bio = BIO_pop(ssl_bio);
+	BIO *buffer_r_bio = BIO_new(BIO_f_buffer());
+	ASSERT_SSL(buffer_r_bio);
+	/*
+	 * read:  buffer --> ssl
+	 * write: ssl --> socket
+	 */
+	SSL *ssl;
+	BIO_get_ssl(ssl_bio, &ssl);
 	ASSERT_SSL(ssl);
+	SSL_set_bio(ssl, buffer_r_bio, sock_bio);
+	/* write: buffer --> ssl --> socket */
+	BIO *buffer_w_bio = BIO_new(BIO_f_buffer());
+	ASSERT_SSL(buffer_w_bio);
+	BIO_push(buffer_w_bio, ssl_bio);
+	/* read: socket --> buffer --> ssl */
+	BIO_push(buffer_r_bio, sock_bio);
 
-	SSL_set_fd(ssl, sock);
-	SSL_set_accept_state(ssl);
-
-	return ssl;
+	bio[0] = ssl_bio;
+	bio[1] = buffer_w_bio;
 }
 
 static void dump_worker_stats__(const stats_t *stats, const char *fmt, ...)
@@ -165,7 +183,8 @@ int main(int argc, const char **argv)
 		fprintf(stderr, "Usage: %s <port> <cipher>\n", argv[0]);
 		exit(-1);
 	}
-	int port = atoi(argv[1]);
+	const char *port = argv[1];
+	const char *cipher = argv[2];
 
 	SSL_library_init();
 	SSL_load_error_strings();
@@ -181,21 +200,31 @@ int main(int argc, const char **argv)
 	err = SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY, SSL_FILETYPE_PEM);
 	ASSERT_SSL(1 == err);
 
-	int sock = ssl_listen(port);
+	BIO *ssl_bio = BIO_new_ssl(ctx, 0);
+	ASSERT_SSL(ssl_bio);
+	SSL *ssl;
+	BIO_get_ssl(ssl_bio, &ssl);
+	ASSERT_SSL(ssl);
+	SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
 
-	printf("Server started on port %i with ciphers %s...\n", port, argv[2]);
+	BIO *accept_bio = ssl_listen(port, ssl_bio);
+
+	printf("Server started on port %s with ciphers %s...\n", port, cipher);
 
 	for (int i=0; i<SESSION_MAX; i++) {
-		SSL *ssl1 = ssl_accept(ctx, sock);
-		SSL *ssl2 = ssl_accept(ctx, sock);
+		BIO *bio1[2], *bio2[2];
+		ssl_accept(bio1, accept_bio);
+		ssl_accept(bio2, accept_bio);
 		int pipe1[2], pipe2[2];
 		err = pipe(pipe1);
 		ASSERT(0 == err, "pipe()");
 		err = pipe(pipe2);
 		ASSERT(0 == err, "pipe()");
-		ssl_worker_spawn(2*i+0, ssl1, pipe1[0], pipe2[1]);
-		ssl_worker_spawn(2*i+1, ssl2, pipe2[0], pipe1[1]);
+		ssl_worker_spawn(2*i+0, bio1, pipe1[0], pipe2[1]);
+		ssl_worker_spawn(2*i+1, bio2, pipe2[0], pipe1[1]);
 	}
+
+	BIO_free_all(accept_bio);
 
 	for (;;) {
 		sleep(1);
