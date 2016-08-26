@@ -97,7 +97,7 @@ static void ssl_worker_spawn(int tid, BIO *bio[2], int in, int out)
 
 static BIO * ssl_listen(const char *port, BIO *ssl_bio)
 {
-	BIO *accept_bio = BIO_new_accept(port);
+	BIO *accept_bio = BIO_new_accept((void *)port);
 	ASSERT_SSL(accept_bio);
 	BIO_set_accept_bios(accept_bio, ssl_bio);
 	int err = BIO_do_accept(accept_bio);
