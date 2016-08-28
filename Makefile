@@ -5,7 +5,7 @@ PORT?=55555
 CIPHER?=AES256-GCM-SHA384
 DURATION?=10
 
-CFLAGS:=-Wall -Werror -g -pthread -std=gnu99
+CFLAGS:=-Wall -g -pthread -std=gnu99
 CFLAGS+= -O2
 LDFLAGS:=-g -pthread
 LDLIBS:=-lssl -lcrypto
@@ -21,15 +21,18 @@ endif
 
 all: server client
 
-server: server.c
+server_opt.c: server_opt.ggo
+	gengetopt -i $^  -F server_opt -a server_opt_args_info -f server_opt_cmdline_parser
+
+server: server.c server_opt.c
 
 client: client.c
 
 clean:
-	$(RM) server client
+	$(RM) server client server_opt.c server_opt.h
 
 test: server client
-	./server $(PORT) $(CIPHER) &
+	./server -p $(PORT) -c $(CIPHER) &
 	sleep 0.5
 	./client 127.0.0.1 $(PORT) $(CIPHER) < /dev/zero > /dev/null &
 	./client 127.0.0.1 $(PORT) $(CIPHER) < /dev/zero > /dev/null &

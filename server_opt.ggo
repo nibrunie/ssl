@@ -1,0 +1,6 @@
+package "bench_ssl"
+description "bench ssl server"
+version "0.1"
+
+option "port" p "server listening port"  long default="5555" optional
+option "cipher" c "cipher use to secure exchange" string default="AES256-GCM-SHA384" optional

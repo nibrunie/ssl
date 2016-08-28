@@ -15,6 +15,8 @@
 #include "common.h"
 #include "stats.h"
 
+#include "server_opt.h"
+
 #define SERVER_CERT			"cert.pem"
 #define SERVER_KEY			SERVER_CERT
 #define SESSION_MAX			1
@@ -161,11 +163,11 @@ static void dump_stats(void)
 
 int main(int argc, const char **argv)
 {
-	if (3 != argc) {
-		fprintf(stderr, "Usage: %s <port> <cipher>\n", argv[0]);
-		exit(-1);
-	}
-	int port = atoi(argv[1]);
+  struct server_opt_args_info args_info;
+  if (server_opt_cmdline_parser(argc, argv, &args_info) != 0)
+    exit(1);
+
+	int port = args_info.port_arg;
 
 	SSL_library_init();
 	SSL_load_error_strings();
@@ -173,7 +175,7 @@ int main(int argc, const char **argv)
 	const SSL_METHOD *meth = SSLv23_method();
 	SSL_CTX *ctx = SSL_CTX_new(meth);
 	ASSERT_SSL(ctx);
-	int err = SSL_CTX_set_cipher_list(ctx, argv[2]);
+	int err = SSL_CTX_set_cipher_list(ctx, args_info.cipher_arg);
 	ASSERT_SSL(1 == err);
 
 	err = SSL_CTX_use_certificate_file(ctx, SERVER_CERT, SSL_FILETYPE_PEM);
