@@ -20,18 +20,149 @@
 #define SERVER_CERT			"cert.pem"
 #define SERVER_KEY			SERVER_CERT
 #define SESSION_MAX			1
+#define MAX_SESSION_PER_THREAD 16
 #define STATS_UPDATE_FREQ	1
+
+#define MAX_PACKET_SIZE;
 
 typedef struct {
 	SSL *ssl;
 	int in;
 	int out;
+  /** buffer used to get output of SSL_read */
+  unsigned char* read_buf;
+  /** buffer used as input to SSL_write */
+  unsigned char* write_buf;
+  /** wait on async offload for async read */
+  int async_wait_read;
+  /** wait on async offload for async write */
+  int async_wait_write;
+  /** size arguments for write buf */
+  int write_size;
+} ssl_session_t;
+
+typedef struct {
+  ssl_session_t sessions[MAX_SESSION_PER_THREAD];
 	pthread_t thread;
 	int tid;
 	stats_t stats;
 } __attribute__((aligned(64))) ssl_worker_t;
 
 ssl_worker_t workers[2*SESSION_MAX];
+
+/** Initialize a session structure */
+static void init_session(ssl_session_t* session, SSL* ssl, int in, int out)
+{
+  session->ssl = ssl;
+  session->in  = in;
+  session->out = out;
+
+  session->read_buf = malloc(sizeof(unsigned char) * MAX_PACKET_SIZE);
+  session->write_buf = malloc(sizeof(unsigned char) * MAX_PACKET_SIZE);
+
+  session->async_wait_write = session->async_wait_read = 0;
+  session->write_size = 0;
+}
+
+/** Clear a session structure */
+static void clean_session(ssl_session_t* session) 
+{
+  free(session->read_buf);
+  free(session->write_buf);
+}
+
+
+static void * ssl_session(void *_session)
+{
+	ssl_session_t *session = _session;
+	SSL *ssl = session->ssl;
+	int in = session->in;
+	int out = session->out;
+  unsigned char* read_buf = session->read_buf;
+  unsigned char* write_buf = session->write_buf;
+
+	int sock = SSL_get_fd(ssl);
+	ASSERT_SSL(sock >= 0);
+	int nfds = (sock < in ? in : sock) + 1;
+
+	for (;;) {
+		timestats_t ts;
+		timestats_start(&ts);
+		for (int i=0; i<STATS_UPDATE_FREQ; i++) {
+      fd_set rfds;
+      FD_ZERO(&rfds);
+
+      if (!session->async_wait_read && !async_wait_write) 
+      {
+        // only select a socket/pipe-out if no async offload operation is pending (simplification)
+			  FD_SET(sock, &rfds);
+			  FD_SET(in, &rfds);
+
+        int err = select(nfds, &rfds, NULL, NULL, NULL);
+        ASSERT(-1 != err, "select()");
+
+      }
+
+      if (session->async_wait_read && FD_ISSET(sock, &rfds)) 
+      {
+        session->async_wait_read = 0;
+				err = SSL_read(ssl, session->read_buf, MAX_PACKET_SIZE);
+				if (0 == err) return 0;
+        if (err < 0) {
+          int ssl_err;
+          switch (ssl_err = SSL_get_error(ssl, err)) {
+          case SSL_ERROR_WANT_ASYNC:
+            session->async_wait_read = 1;
+            break;
+          default:
+            assert(0 && "unsupported error code");
+            break;
+          }
+        } else {
+          ASSERT_SSL(PACKET_SIZE == err);
+          err = write(out, session->read_buf, err);
+          if (0 == err) return 0;
+          ASSERT(PACKET_SIZE == err, "write()");
+        }
+      };
+
+      if (FD_ISSET(in, &rfds) || session->async_wait_write) 
+      {
+        // reading from pipe output
+        if (FD_ISSET(in, &rfds)) {
+          err = read(in, session->write_buf, MAX_PACKET_SIZE);
+          if (0 == err) return 0;
+          ASSERT(MAX_PACKET_SIZE == err, "read()");
+          session->write_size = err;
+        }
+
+        // trying to write read data to secure connection
+        session->async_wait_write = 0;
+				err = SSL_write(ssl, session->write_buf, session->write_size);
+        if (err < 0) {
+          int ssl_err;
+          switch (ssl_err = SSL_get_error(ssl, err)) {
+          case SSL_ERROR_WANT_ASYNC:
+            session->async_wait_write = 1;
+            break;
+          default:
+            assert(0 && "unsupported error code");
+            break;
+          }
+        } else {
+          if (0 == err) return 0;
+          ASSERT_SSL(PACKET_SIZE == err);
+        }
+      }
+
+      // explicit yield 
+      ASYNC_pause_job();
+		}
+		timestats_stop(&ts);
+		stats_update(&worker->stats, STATS_UPDATE_FREQ, PACKET_SIZE, &ts);
+	}
+	return NULL;
+}
 
 static void * ssl_worker(void *worker_)
 {
