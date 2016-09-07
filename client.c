@@ -69,7 +69,7 @@ int main(int argc, const char **argv)
 			ASSERT_SSL(sizeof(buf) == err);
 		}
 		if (FD_ISSET(sock, &rfds)) {
-			err = SSL_read(ssl, buf, err);
+			err = SSL_read(ssl, buf, sizeof(buf));
 			if (0 == err) break;
 			ASSERT_SSL(sizeof(buf) == err);
 			err = write(STDOUT_FILENO, buf, sizeof(buf));
